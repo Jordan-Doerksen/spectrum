@@ -186,8 +186,23 @@ impl Engine {
     }
 }
 
+/// Fingerprint a headline for dedupe. Drops a trailing " - Publisher" (Google News
+/// appends it, so the same story from different sources collapses to one key), then
+/// lowercases and strips punctuation. Cross-source near-dupes with genuinely DIFFERENT
+/// wording still slip through — that needs semantic dedupe (future).
 fn norm(t: &str) -> String {
-    t.trim().to_lowercase()
+    let t = t.trim();
+    let core = match t.rfind(" - ") {
+        Some(i) if i > 0 => &t[..i],
+        _ => t,
+    };
+    core.to_lowercase()
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c } else { ' ' })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn now_unix() -> Option<u64> {

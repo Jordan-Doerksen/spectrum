@@ -2,6 +2,18 @@
 
 Phase log for Spectrum. Newest first. Absolute dates (YYYY-MM-DD).
 
+## 2026-06-24 — Fix: duplicate posts (post-handoff)
+- **Single-instance lock** (`tauri-plugin-single-instance`): a second launch focuses the
+  existing window instead of starting a second engine — kills "two copies on one box" dupes
+  and makes Stop authoritative.
+- **Tighter dedupe:** `norm()` drops a trailing " - Publisher" (Google News) and strips
+  punctuation, so the same story from a desk and a sweep collapse to one fingerprint.
+- Operational rule: one host only — shared webhooks mean two machines double-post. [D-0013]
+
+## 2026-06-24 — M5: published + portfolio
+- Doc set + public repo (github.com/Jordan-Doerksen/spectrum) + Observatory card (head of the
+  lineage); the three predecessors archived with "Superseded by Spectrum". [D-0012]
+
 ## 2026-06-24 — M4: standalone package for Riley
 - Release exe (self-contained: only `WebView2Loader.dll` beyond system DLLs), system tray
   (minimize-to-tray + Start/Stop/Quit menu), `SPECTRUM_AUTOSTART` (boots running into the tray).

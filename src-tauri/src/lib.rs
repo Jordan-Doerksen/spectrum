@@ -178,6 +178,15 @@ pub fn run() {
             .expect("failed to spawn engine thread");
     }
     tauri::Builder::default()
+        // A second launch just focuses the existing window — it never starts a second
+        // engine (which would double-post). Single-instance MUST be the first plugin.
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            use tauri::Manager;
+            if let Some(w) = app.get_webview_window("main") {
+                let _ = w.show();
+                let _ = w.set_focus();
+            }
+        }))
         .manage(shared)
         .setup(|app| {
             use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};

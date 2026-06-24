@@ -125,3 +125,27 @@ Ollama + pulls llama3.1:8b; `INSTALL-AUTOSTART.bat` adds the Startup shortcut + 
 **Consequence:** 7.13 MB zip, unzip→run, no manual dep installs. WebView2 runtime assumed present
 (Win10/11). Single-host like macroscope: only Riley runs it live, or copies double-post the shared
 channels. SETUP + autostart reuse macroscope's verified pattern; the clean-box end-to-end is Riley-side.
+
+### D-0012 — M5: published public, on the Observatory, the predecessors retired
+**Context:** M5 — the north-star wrap: a standalone repo + the portfolio + retiring the three engines this one replaces.
+**Call:** Full doc set (README/SPEC/HANDOFF/CHANGELOG/DECISIONS/LICENSE/config.example.json),
+`git init` + first commit (secrets gitignored — config.local.json + data/ untracked), pushed
+**PUBLIC** to github.com/Jordan-Doerksen/spectrum (operator-confirmed visibility). Added the Spectrum
+card to the live Observatory as the head of the news-engine lineage. Retired doomfeed/macroscope/richter:
+kept their portfolio cards (the lineage tells the story) but archived the GitHub repos + set
+"Superseded by Spectrum" descriptions.
+**Consequence:** Lineage Doomfeed → Macroscope → Richter → Spectrum, one live engine. **Project complete (M0–M5).**
+
+### D-0013 — Fix duplicate posts: single-instance + cross-source dedupe (+ the one-host rule)
+**Context:** Live dupes after handoff. Two causes: (1) two instances on one box (e.g. the
+panel plus the package's hidden-tray `START.bat` instance) both polling and racing the same
+`seen.json` — and Stop on one couldn't stop the other; (2) overlapping feeds posting the same
+story with slightly different titles (Google News appends " - Publisher"), which the
+exact-title fingerprint missed.
+**Call:** (1) `tauri-plugin-single-instance` (registered first) — a 2nd launch focuses the
+existing window, never starts a 2nd engine. (2) `norm()` drops a trailing " - Publisher" and
+strips punctuation before fingerprinting. (3) Operational: ONE host runs live — shared webhooks
+mean two machines double-post regardless; the other runs Dry, or not at all.
+**Consequence:** No double-instance dupes; near-dupe sweeps collapse. Genuinely different wording
+for the same event still slips (semantic dedupe = future). Changing the fingerprint makes old
+`seen.json` keys stale → delete it for a fresh seed on the fixed build.
