@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Core capabilities for the Spectrum control-panel window. App-defined commands (status, start, stop, …) are always allowed; this grants the core defaults the window needs.",
+  "windows": ["main"],
+  "permissions": ["core:default"]
+}

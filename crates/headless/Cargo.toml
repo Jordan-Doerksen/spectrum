@@ -1,0 +1,18 @@
+[package]
+name = "spectrum-headless"
+description = "Spectrum — pure-server runner (no window). Same engine the Tauri shell embeds."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "spectrum-headless"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0.102"
+spectrum-engine = { path = "../engine" }
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "time"] }
+# tokio + anyhow added via `cargo add`.

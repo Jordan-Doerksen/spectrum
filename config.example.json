@@ -1,0 +1,13 @@
+{
+  "_comment": "Copy this to config.local.json (gitignored) and paste your Discord webhook URLs. Point 'technology' at its own channel, or reuse the 'political' URL to fold tech into politics.",
+  "webhooks": {
+    "financial": "https://discord.com/api/webhooks/XXXXXXXX/XXXXXXXX",
+    "political": "https://discord.com/api/webhooks/XXXXXXXX/XXXXXXXX",
+    "technology": "https://discord.com/api/webhooks/XXXXXXXX/XXXXXXXX",
+    "catastrophe": "https://discord.com/api/webhooks/XXXXXXXX/XXXXXXXX"
+  },
+  "model": "llama3.1:8b",
+  "min_severity": 2,
+  "poll_minutes": 10,
+  "drip_seconds": 90
+}

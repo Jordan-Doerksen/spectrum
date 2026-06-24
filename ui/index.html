@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Spectrum — news watcher</title>
+<link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+<div class="bg" aria-hidden="true"><div class="glow"></div><div class="scan"></div></div>
+
+<div class="app">
+  <header class="top">
+    <div class="brand"><span class="prism">◣◤</span> <b>SPECTRUM</b> <span class="sub">news watcher</span></div>
+    <div class="state">
+      <span class="pill" id="statePill"><span class="dot"></span><span id="stateTxt">—</span></span>
+      <span class="lastpoll" id="lastPoll">—</span>
+    </div>
+  </header>
+
+  <section class="controls">
+    <button class="btn go" id="btnStart">▶ Start</button>
+    <button class="btn stop" id="btnStop">■ Stop</button>
+    <label class="toggle"><input type="checkbox" id="dry" /> Dry run — classify but don't post</label>
+  </section>
+
+  <section class="tiles">
+    <div class="tile fin"><div class="k">Finance</div><div class="v" id="cFin">0</div></div>
+    <div class="tile pol"><div class="k">Politics</div><div class="v" id="cPol">0</div></div>
+    <div class="tile tec"><div class="k">Tech</div><div class="v" id="cTec">0</div></div>
+    <div class="tile cat"><div class="k">Crisis</div><div class="v" id="cCat">0</div></div>
+  </section>
+
+  <section class="meta">
+    <div class="m"><span>seen</span><b id="mSeen">—</b></div>
+    <div class="m"><span>queued</span><b id="mQueued">—</b></div>
+    <div class="m"><span>feeds</span><b id="mFeeds">—</b></div>
+    <div class="m posted"><span>posted this session</span><b id="mPosted">—</b></div>
+  </section>
+
+  <section class="tune">
+    <div class="tune-row">
+      <label>min severity <input type="number" id="tMin" min="1" max="4" /></label>
+      <label>poll (min) <input type="number" id="tPoll" min="1" /></label>
+      <label>drip (sec) <input type="number" id="tDrip" min="5" /></label>
+      <button class="btn ghost" id="btnSave">Save</button>
+      <span class="saved" id="saved" hidden>saved ✓</span>
+    </div>
+    <div class="bands" id="bands"></div>
+  </section>
+
+  <section class="logwrap">
+    <div class="log-h">Activity</div>
+    <div class="log" id="log"></div>
+  </section>
+
+  <footer class="foot"><span class="star">✦</span> Spectrum · The Observatory · MMXXVI</footer>
+</div>
+
+<script src="app.js"></script>
+</body>
+</html>

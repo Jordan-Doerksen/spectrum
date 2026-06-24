@@ -1,0 +1,14 @@
+# Rust build artifacts
+/target
+**/target
+
+# Secrets + local config (webhooks live here, never committed) — macroscope lesson
+.env
+config.local.json
+
+# Engine state
+data/
+*.log
+
+# Tauri codegen
+src-tauri/gen/

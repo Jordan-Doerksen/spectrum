@@ -1,0 +1,18 @@
+[package]
+name = "spectrum-engine"
+description = "Spectrum — the unified news pipeline (RSS -> local-LLM read -> themed Discord cards). Pure-Rust, no C toolchain."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+# Deps are added via `cargo add` (resolves real latest versions on this box).
+# Kept C-free on purpose: reqwest uses the default native-tls -> Windows SChannel
+# (no OpenSSL, no `cc`), matching v4's no-C-compiler GNU setup. [mirrors D-0023]
+[dependencies]
+anyhow = "1.0.102"
+feed-rs = "2.3.1"
+reqwest = { version = "0.13.4", default-features = false, features = ["native-tls", "gzip", "json"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"

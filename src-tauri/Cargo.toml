@@ -1,0 +1,29 @@
+[package]
+name = "spectrum-pro"
+description = "Spectrum — the control panel (Tauri 2 shell over the engine)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "spectrum-pro"
+path = "src/main.rs"
+
+[lib]
+name = "spectrum_pro_lib"
+path = "src/lib.rs"
+
+# Pure-Rust codegen — no C toolchain (mirrors v4 D-0023).
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+# The webview shell. No bundler-only features; the UI reaches the engine through
+# withGlobalTauri + invoke commands (mirrors v4 D-0023).
+tauri = { version = "2", features = ["tray-icon"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt", "time", "net", "io-util"] }
+spectrum-engine = { path = "../crates/engine" }

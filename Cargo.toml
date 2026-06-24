@@ -1,0 +1,10 @@
+[workspace]
+resolver = "2"
+members = ["crates/engine", "crates/headless", "src-tauri"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["Jordan Doerksen"]
+repository = "https://github.com/Jordan-Doerksen/spectrum"
