@@ -1,7 +1,7 @@
 # Assemble the Spectrum-for-Riley package: release exe + DLLs + config (with webhooks,
 # a private deploy) + launchers, zipped to Downloads. Run AFTER `cargo build --release -p spectrum-pro`.
 
-$root    = "C:\projects\spectrum"
+$root    = "C:\projects\tools\spectrum"
 $rel     = Join-Path $root "target\release"
 $exe     = Join-Path $rel  "spectrum-pro.exe"
 $winlibs = Join-Path $env:USERPROFILE "winlibs\mingw64\bin"

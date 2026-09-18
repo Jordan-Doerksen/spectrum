@@ -1,7 +1,7 @@
 # Spectrum — Build Handoff
 
 > Read SPEC.md for the full design and DECISIONS.md for the why. This is the kickoff:
-> how to stand up and build it. Home repo: `spectrum` (`C:\projects\spectrum`).
+> how to stand up and build it. Home repo: `spectrum` (`C:\projects\tools\spectrum`).
 
 > **Progress (as built, 2026-06-24):** Complete. Engine + live Discord posting + control
 > panel + a self-contained Riley package, all verified. M0–M4 done; M5 (this doc set +
