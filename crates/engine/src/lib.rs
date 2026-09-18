@@ -12,6 +12,7 @@ pub mod config;
 pub mod discord;
 pub mod engine;
 pub mod feeds;
+pub mod log;
 pub mod rss;
 pub mod skins;
 pub mod store;

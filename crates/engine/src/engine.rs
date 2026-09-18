@@ -2,13 +2,47 @@
 //! runner AND the Tauri panel drive the SAME logic (the v4 discipline: behaviour in
 //! the engine crate, thin shells on top). Owns config + seen-store + the drip queue
 //! + session stats + a recent-activity log.
+//!
+//! Every failure path writes a record through `crate::log`: it names the action that
+//! did NOT happen, and why. A silent failure is a defect (observability law, CR-1
+//! chunk 0). The 200-line in-memory ring stays, because the panel reads it, so a
+//! failure line goes into BOTH the ring and the disk log. The human lines the engine
+//! returns are unchanged, with one exception: a card with no webhook now reads
+//! "card DROPPED" instead of "held", because "held" was false — the card is gone.
+//!
+//! Split by domain (house law: review at 300 lines). This file is the service object:
+//! the config lifecycle, the store, the ring, and the snapshot the panel reads.
+//!   * `engine/gather.rs` — ingest: the feeds and the first-run seed.
+//!   * `engine/poll.rs`   — classify: the analyzer read and the queue.
+//!   * `engine/drip.rs`   — deliver: the Discord post, and every lost card.
+//!   * `engine/cycle.rs`  — the counters and the two run-summary records.
+//!   * `engine/keys.rs`   — the dedupe fingerprint and the clock.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+mod cycle;
+mod drip;
+mod gather;
+mod keys;
+mod poll;
 
-use crate::analyze::{self, Category, Read};
-use crate::config::Config;
+pub use keys::norm;
+
+use std::collections::{HashMap, VecDeque};
+use std::path::Path;
+
+use crate::analyze::{Category, Read};
+use crate::config::{Config, LogConfig};
+use crate::log;
 use crate::store::Seen;
-use crate::{discord, feeds, rss, skins};
+use crate::{feeds, rss};
+use cycle::Drops;
+
+/// The bands a card can carry. `Drop` never posts, so it needs no webhook.
+const BANDS: [Category; 4] = [
+    Category::Financial,
+    Category::Political,
+    Category::Technology,
+    Category::Catastrophe,
+];
 
 pub struct Engine {
     pub cfg_path: String,
@@ -18,6 +52,7 @@ pub struct Engine {
     queue: Vec<(rss::Item, Read)>,
     client: reqwest::Client,
     posted: HashMap<String, usize>, // band key -> count this session
+    drops: Drops,                   // cards that left the queue and never posted
     last_poll_unix: Option<u64>,
     log: VecDeque<String>, // recent activity, newest at the back
 }
@@ -31,6 +66,12 @@ pub struct Status {
     pub posted_political: usize,
     pub posted_technology: usize,
     pub posted_catastrophe: usize,
+    /// Cards lost this session, by reason. A lost card never comes back: it is out of
+    /// the queue and its headline is already marked seen. [CR-1 chunk 0]
+    pub dropped_total: usize,
+    pub dropped_dry: usize,
+    pub dropped_no_webhook: usize,
+    pub dropped_post_failed: usize,
     pub last_poll_unix: Option<u64>,
     pub min_severity: u8,
     pub poll_minutes: u64,
@@ -40,13 +81,39 @@ pub struct Status {
 
 impl Engine {
     pub fn new(cfg_path: &str) -> anyhow::Result<Self> {
-        let cfg = Config::load(cfg_path)?;
-        let base = std::path::Path::new(cfg_path)
-            .parent()
-            .unwrap_or_else(|| std::path::Path::new("."));
+        let base = Path::new(cfg_path).parent().unwrap_or_else(|| Path::new("."));
+        let cfg = match Config::load(cfg_path) {
+            Ok(c) => {
+                start_log(&c.logging, base);
+                c
+            }
+            Err(e) => {
+                start_log(&LogConfig::default(), base);
+                log::error("config.load.failed")
+                    .field("path", cfg_path)
+                    .field("error", format!("{e:#}"))
+                    .not_doing(
+                        "start the engine",
+                        "no config means no webhooks and no tuning; the caller reports the error and exits",
+                    )
+                    .emit();
+                return Err(e);
+            }
+        };
         let seen_file = base.join(&cfg.seen_path).to_string_lossy().to_string();
         let seen = Seen::load(&seen_file);
-        Ok(Self {
+        log::info("engine.started")
+            .field("config", cfg_path)
+            .field("seen_file", &seen_file)
+            .count("seen", seen.len())
+            .count("feeds", feeds::feeds().len())
+            .num("min_severity", cfg.min_severity as i64)
+            .num("poll_minutes", cfg.poll_minutes as i64)
+            .num("drip_seconds", cfg.drip_seconds as i64)
+            .count("max_per_drop", cfg.max_per_drop)
+            .flag("seed_pending", seen.is_empty())
+            .emit();
+        let engine = Self {
             cfg_path: cfg_path.to_string(),
             cfg,
             seen_file,
@@ -54,15 +121,48 @@ impl Engine {
             queue: Vec::new(),
             client: crate::ua_client(),
             posted: HashMap::new(),
+            drops: Drops::default(),
             last_poll_unix: None,
             log: VecDeque::new(),
-        })
+        };
+        engine.report_missing_webhooks();
+        Ok(engine)
+    }
+
+    /// A band with no webhook loses every card it clears. Say so at the start, not at
+    /// the moment a card dies.
+    fn report_missing_webhooks(&self) {
+        for band in BANDS {
+            if self.cfg.webhook_for(band.key()).is_none() {
+                log::warn("webhook.missing")
+                    .field("band", band.key())
+                    .not_doing(
+                        "post any card in this band",
+                        "config.local.json has no webhook for this key, so a cleared card leaves the queue and is lost",
+                    )
+                    .emit();
+            }
+        }
     }
 
     /// Re-read config.local.json (so the panel's edits go live without a restart).
     pub fn reload_config(&mut self) {
-        if let Ok(c) = Config::load(&self.cfg_path) {
-            self.cfg = c;
+        match Config::load(&self.cfg_path) {
+            Ok(c) => {
+                self.cfg = c;
+                log::debug("config.reloaded").field("path", &self.cfg_path).emit();
+            }
+            Err(e) => {
+                let line = log::warn("config.reload.failed")
+                    .field("path", &self.cfg_path)
+                    .field("error", format!("{e:#}"))
+                    .not_doing(
+                        "apply the edited config",
+                        "the config already in memory stays live, so an edit made now has no effect",
+                    )
+                    .emit();
+                self.note(line);
+            }
         }
     }
 
@@ -70,98 +170,30 @@ impl Engine {
         self.seen.is_empty()
     }
 
+    /// Put one human line in the ring the panel reads. Every line is redacted on the way
+    /// in — see [`ring_line`].
     fn note(&mut self, line: String) {
-        self.log.push_back(line);
+        self.log.push_back(ring_line(line));
         while self.log.len() > 200 {
             self.log.pop_front();
         }
     }
 
-    /// First-run seed: mark every current headline seen, post nothing. Returns count.
-    pub async fn seed(&mut self) -> usize {
-        let items = self.gather().await;
-        for it in &items {
-            self.seen.insert(norm(&it.title));
-        }
-        let _ = self.seen.save(&self.seen_file);
-        let n = items.len();
-        self.note(format!("seeded {n} headlines (posted nothing)"));
-        n
-    }
-
-    /// Fetch every feed, deduped by title within the batch.
-    async fn gather(&self) -> Vec<rss::Item> {
-        let mut items = Vec::new();
-        let mut batch = HashSet::new();
-        for feed in feeds::feeds() {
-            if let Ok(list) = rss::fetch(&self.client, &feed).await {
-                for it in list {
-                    if it.title.trim().is_empty() || !batch.insert(norm(&it.title)) {
-                        continue;
-                    }
-                    items.push(it);
-                }
-            }
-        }
-        items
-    }
-
-    /// Poll: classify only UNSEEN items, enqueue the cleared ones. Returns new count.
-    pub async fn poll(&mut self) -> usize {
-        let items = self.gather().await;
-        let mut new = 0;
-        for it in items {
-            let key = norm(&it.title);
-            if self.seen.contains(&key) {
-                continue;
-            }
-            if let Ok(read) = analyze::analyze(&self.client, &it.title, &it.source).await {
-                self.seen.insert(key);
-                if read.category != Category::Drop && read.severity >= self.cfg.min_severity {
-                    self.queue.push((it, read));
-                    new += 1;
-                }
-            }
-        }
-        self.queue.sort_by(|a, b| b.1.severity.cmp(&a.1.severity)); // strongest first
-        let _ = self.seen.save(&self.seen_file);
-        self.last_poll_unix = now_unix();
-        self.note(format!(
-            "poll: {new} new · {} queued · {} seen",
-            self.queue.len(),
-            self.seen.len()
-        ));
-        new
-    }
-
-    /// Drip: post up to `max_per_drop` strongest cards. Returns the lines it logged.
-    pub async fn drip(&mut self, dry: bool) -> Vec<String> {
-        let mut out = Vec::new();
-        let mut posted = 0;
-        while posted < self.cfg.max_per_drop && !self.queue.is_empty() {
-            let (it, read) = self.queue.remove(0);
-            let s = skins::skin(read.category);
-            let webhook = self.cfg.webhook_for(read.category.key()).cloned();
-
-            let line = if dry {
-                format!("[dry] {} {} — {}", s.emoji, s.label, it.title)
-            } else if let Some(url) = webhook {
-                let payload = discord::embed(read.category, &read, &it.title, &it.link, &it.source);
-                match discord::post(&self.client, &url, &payload).await {
-                    Ok(()) => {
-                        *self.posted.entry(read.category.key().to_string()).or_insert(0) += 1;
-                        format!("posted {} {} — {}", s.emoji, s.label, it.title)
-                    }
-                    Err(e) => format!("post FAILED {} — {e}", s.label),
-                }
-            } else {
-                format!("no webhook for {} — held", s.label)
-            };
-            out.push(line.clone());
+    /// Save the dedupe store. A failed save is loud: this run's keys then live in
+    /// memory only, so a restart re-reads the same headlines and can post them.
+    fn save_seen(&mut self, phase: &str) {
+        if let Err(e) = self.seen.save(&self.seen_file) {
+            let line = log::error("seen.save.failed")
+                .field("phase", phase)
+                .field("path", &self.seen_file)
+                .field("error", format!("{e:#}"))
+                .not_doing(
+                    "persist the dedupe store",
+                    "this run's keys stay in memory only, so a restart reads the same headlines again and can post them",
+                )
+                .emit();
             self.note(line);
-            posted += 1;
         }
-        out
     }
 
     pub fn status(&self) -> Status {
@@ -172,6 +204,10 @@ impl Engine {
             posted_political: *self.posted.get("political").unwrap_or(&0),
             posted_technology: *self.posted.get("technology").unwrap_or(&0),
             posted_catastrophe: *self.posted.get("catastrophe").unwrap_or(&0),
+            dropped_total: self.drops.total(),
+            dropped_dry: self.drops.dry,
+            dropped_no_webhook: self.drops.no_webhook,
+            dropped_post_failed: self.drops.post_failed,
             last_poll_unix: self.last_poll_unix,
             min_severity: self.cfg.min_severity,
             poll_minutes: self.cfg.poll_minutes,
@@ -186,28 +222,54 @@ impl Engine {
     }
 }
 
-/// Fingerprint a headline for dedupe. Drops a trailing " - Publisher" (Google News
-/// appends it, so the same story from different sources collapses to one key), then
-/// lowercases and strips punctuation. Cross-source near-dupes with genuinely DIFFERENT
-/// wording still slip through — that needs semantic dedupe (future).
-fn norm(t: &str) -> String {
-    let t = t.trim();
-    let core = match t.rfind(" - ") {
-        Some(i) if i > 0 => &t[..i],
-        _ => t,
-    };
-    core.to_lowercase()
-        .chars()
-        .map(|c| if c.is_alphanumeric() { c } else { ' ' })
-        .collect::<String>()
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
+/// The one gate every line into the ring passes: cut the secrets out of it.
+///
+/// The ring is not the disk log. `Engine::recent_log` hands it to the Tauri panel, which
+/// renders it in the window (`ui\app.js:38-40`), so a line built with `format!` around an
+/// error reaches a person unredacted unless it is cut here. reqwest's transport errors
+/// carry the full request URL, and on the drip path that url is the Discord webhook with
+/// its token. One cut here covers every call site, present and future. [CR-1 chunk 0]
+fn ring_line(line: String) -> String {
+    log::redact(&line)
 }
 
-fn now_unix() -> Option<u64> {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .ok()
-        .map(|d| d.as_secs())
+/// Open this run's log file. Safe when the runner already opened it: `log::init` pins
+/// one file per process. A logger that cannot open its file says so on the console and
+/// the engine continues — a missing log must never stop the news.
+fn start_log(cfg: &LogConfig, base: &Path) {
+    if let Err(e) = log::init(cfg, base) {
+        log::error("log.init.failed")
+            .field("dir", &cfg.dir)
+            .field("error", format!("{e:#}"))
+            .not_doing(
+                "write a log file for this run",
+                "the console lines are the only record until that path is writable",
+            )
+            .emit();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ring_line;
+
+    const FAKE_ID: &str = "100000000000000000";
+    const FAKE_TOKEN: &str = "FAKEtokenVALUE-Nf9x_ZZ-notReal";
+
+    /// No string that reaches `note()` can carry a webhook token into the panel window.
+    #[test]
+    fn a_line_carrying_a_webhook_url_loses_its_token_before_it_enters_the_ring() {
+        let line = ring_line(format!(
+            "post FAILED CRISIS — error sending request for url (https://discord.com/api/webhooks/{FAKE_ID}/{FAKE_TOKEN})"
+        ));
+
+        assert!(!line.contains(FAKE_TOKEN), "the ring must not carry a token: {line}");
+        assert!(line.contains(FAKE_ID), "the id names the channel and is not a secret");
+    }
+
+    #[test]
+    fn an_ordinary_activity_line_reaches_the_ring_unchanged() {
+        let line = "poll: 3 new · 12 queued · 2281 seen";
+        assert_eq!(ring_line(line.to_string()), line);
+    }
 }

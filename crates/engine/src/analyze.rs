@@ -1,6 +1,14 @@
 //! The analyzer — one Ollama pass per item returns `{ category, read, severity }`.
 //! This is the single LLM read that replaces the three engines' separate analyzers.
 //! Neutral, no fabrication, no severity inflation (the macroscope/richter lessons).
+//!
+//! [`coerce`] degrades a sloppy response rather than crashing the cycle, and that
+//! degrading used to be silent: a category word no arm recognised became `Drop`, and a
+//! severity that was not a number became 1, which is under the default floor. Either way
+//! the headline is marked seen and can never be offered again, so a model whose output
+//! format has drifted looked exactly like a quiet news day. The behaviour is unchanged,
+//! but what could not be mapped now comes back beside the [`Read`] as [`Unmapped`], and
+//! the caller writes one record per distinct word. [CR-1 chunk 0 · observability law]
 
 use serde::Deserialize;
 
@@ -36,6 +44,31 @@ pub struct Read {
     pub confidence: String,
 }
 
+/// What the model said that the mapping did not recognise. Empty on a clean response.
+/// A value here means the item was degraded, not understood — and a degraded item is
+/// dropped and marked seen, so it never gets a second reading. [CR-1 chunk 0]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Unmapped {
+    /// the raw `category` word, when no arm matched it. The item becomes `Drop`.
+    pub category: Option<String>,
+    /// the raw `severity` value, when it was not a number. The item becomes severity 1.
+    pub severity: Option<String>,
+}
+
+impl Unmapped {
+    pub fn any(&self) -> bool {
+        self.category.is_some() || self.severity.is_some()
+    }
+    /// The words themselves, as one key, so repeats of the same drift roll up together.
+    pub fn key(&self) -> String {
+        format!(
+            "category={} severity={}",
+            self.category.as_deref().unwrap_or("-"),
+            self.severity.as_deref().unwrap_or("-")
+        )
+    }
+}
+
 #[derive(Deserialize)]
 struct OllamaResp {
     response: String,
@@ -56,7 +89,13 @@ struct RawRead {
 const MODEL: &str = "llama3.1:8b";
 const OLLAMA: &str = "http://localhost:11434/api/generate";
 
-pub async fn analyze(client: &reqwest::Client, title: &str, source: &str) -> anyhow::Result<Read> {
+/// One read of one headline. The second half of the pair is what the mapping could not
+/// recognise in the model's answer — empty when the answer was clean.
+pub async fn analyze(
+    client: &reqwest::Client,
+    title: &str,
+    source: &str,
+) -> anyhow::Result<(Read, Unmapped)> {
     let prompt = format!(
         "You are a neutral news-desk router. Classify the headline into exactly ONE band and give a terse read.\n\
          Bands:\n\
@@ -94,9 +133,14 @@ pub async fn analyze(client: &reqwest::Client, title: &str, source: &str) -> any
 }
 
 /// Map the model's free-text fields onto our typed packet, clamped + defaulted so a
-/// sloppy response degrades to a safe `Drop` rather than crashing the cycle.
-fn coerce(raw: RawRead) -> Read {
-    let category = match raw.category.to_lowercase().replace('_', "-").as_str() {
+/// sloppy response degrades to a safe `Drop` rather than crashing the cycle. The second
+/// return value names every field the mapping could not read, so the degrading is not
+/// silent.
+fn coerce(raw: RawRead) -> (Read, Unmapped) {
+    let mut unmapped = Unmapped::default();
+
+    let word = raw.category.to_lowercase().replace('_', "-");
+    let category = match word.as_str() {
         "financial" | "finance" | "money" | "markets" | "economy" | "business" => Category::Financial,
         "political" | "politics" | "policy" | "government" | "election" | "geopolitics" => {
             Category::Political
@@ -105,23 +149,107 @@ fn coerce(raw: RawRead) -> Read {
         "catastrophe" | "crisis" | "war" | "disaster" | "conflict" | "humanitarian" => {
             Category::Catastrophe
         }
-        _ => Category::Drop,
+        // `drop` is the model doing as it was told; anything else is drift, and the two
+        // must not look the same in the log.
+        "drop" => Category::Drop,
+        _ => {
+            unmapped.category = Some(raw.category.clone());
+            Category::Drop
+        }
     };
+
     let severity = (match &raw.severity {
-        serde_json::Value::Number(n) => n.as_u64().unwrap_or(1) as u8,
-        serde_json::Value::String(s) => s.trim().parse().unwrap_or(1),
-        _ => 1,
+        serde_json::Value::Number(n) => match n.as_u64() {
+            Some(v) => v as u8,
+            // a float or a negative number: the scale is 1..=4 and this is not on it
+            None => {
+                unmapped.severity = Some(n.to_string());
+                1
+            }
+        },
+        serde_json::Value::String(s) => s.trim().parse().unwrap_or_else(|_| {
+            unmapped.severity = Some(s.clone());
+            1
+        }),
+        serde_json::Value::Null => 1,
+        other => {
+            unmapped.severity = Some(other.to_string());
+            1
+        }
     })
     .clamp(1, 4);
+
     let confidence = if raw.confidence.is_empty() {
         "low".into()
     } else {
         raw.confidence.to_lowercase()
     };
-    Read {
-        category,
-        read: raw.read,
-        severity,
-        confidence,
+    (
+        Read {
+            category,
+            read: raw.read,
+            severity,
+            confidence,
+        },
+        unmapped,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn raw(category: &str, severity: serde_json::Value) -> RawRead {
+        RawRead {
+            category: category.into(),
+            read: "a terse read".into(),
+            severity,
+            confidence: "high".into(),
+        }
+    }
+
+    #[test]
+    fn a_clean_answer_maps_with_nothing_left_over() {
+        let (read, unmapped) = coerce(raw("financial", serde_json::json!(3)));
+        assert_eq!(read.category, Category::Financial);
+        assert_eq!(read.severity, 3);
+        assert!(!unmapped.any(), "a clean answer must report no drift: {unmapped:?}");
+    }
+
+    #[test]
+    fn the_model_obeying_the_drop_instruction_is_not_drift() {
+        let (read, unmapped) = coerce(raw("drop", serde_json::json!(1)));
+        assert_eq!(read.category, Category::Drop);
+        assert!(!unmapped.any(), "an explicit drop is the prompt working, not a failure");
+    }
+
+    #[test]
+    fn a_category_word_no_arm_knows_is_reported_and_still_dropped() {
+        let (read, unmapped) = coerce(raw("sports-and-culture", serde_json::json!(2)));
+        assert_eq!(read.category, Category::Drop, "the behaviour is unchanged");
+        assert_eq!(unmapped.category.as_deref(), Some("sports-and-culture"));
+        assert!(unmapped.key().contains("sports-and-culture"), "the log line names the word");
+    }
+
+    #[test]
+    fn a_severity_that_is_not_a_number_is_reported_and_still_becomes_one() {
+        let (read, unmapped) = coerce(raw("financial", serde_json::json!("very high")));
+        assert_eq!(read.severity, 1, "the behaviour is unchanged: under the default floor");
+        assert_eq!(unmapped.severity.as_deref(), Some("very high"));
+    }
+
+    #[test]
+    fn a_severity_written_as_a_numeric_string_still_maps_cleanly() {
+        let (read, unmapped) = coerce(raw("financial", serde_json::json!("3")));
+        assert_eq!(read.severity, 3);
+        assert!(!unmapped.any(), "a number in quotes is not drift");
+    }
+
+    #[test]
+    fn a_missing_severity_field_is_the_recorded_default_and_not_drift() {
+        // `#[serde(default)]` gives `Value::Null` when the model omits the field.
+        let (read, unmapped) = coerce(raw("political", serde_json::Value::Null));
+        assert_eq!(read.severity, 1);
+        assert!(!unmapped.severity.is_some(), "an absent field is the known default path");
     }
 }

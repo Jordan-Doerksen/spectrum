@@ -9,5 +9,24 @@
   "model": "llama3.1:8b",
   "min_severity": 2,
   "poll_minutes": 10,
-  "drip_seconds": 90
+  "drip_seconds": 90,
+  "logging": {
+    "_comment": "The disk logger. One JSON object per event, one file per run. Every key here is optional: leave the whole block out and these same defaults apply. 'dir' resolves relative to this config file. 'file_pattern' substitutes {date} {time} {pid} {run}. Levels are off | error | warn | info | debug. A run file rotates at 'max_file_bytes' and one run keeps at most 'max_files_per_run' files (the live one included); 'keep_run_files' is how many earlier runs stay in the directory. Webhook URLs and tokens are redacted before anything is written.",
+    "enabled": true,
+    "dir": "data/logs",
+    "file_pattern": "spectrum-{date}-{time}-{pid}.jsonl",
+    "file_level": "info",
+    "console_level": "info",
+    "max_file_bytes": 5000000,
+    "max_files_per_run": 3,
+    "keep_run_files": 20
+  },
+  "lock": {
+    "_comment": "The headless runner's single-instance lock, which stops a second copy on this host from racing data/seen.json and posting every card twice. Every key is optional: leave the whole block out and these same defaults apply. The file sits in the directory 'seen_path' resolves into. The holder rewrites its heartbeat every 'beat_seconds'; a lock whose owner cannot be found in the task list counts as dead once its heartbeat is older than beat_seconds x missed_beats (90 s by default). 'read_tries' and 'read_retry_ms' cover a read that lands while the record is being rewritten.",
+    "file_name": "spectrum-headless.lock",
+    "beat_seconds": 15,
+    "missed_beats": 6,
+    "read_tries": 3,
+    "read_retry_ms": 250
+  }
 }

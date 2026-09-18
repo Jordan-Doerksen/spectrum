@@ -5,14 +5,24 @@
 //! cheap snapshot (status + recent log) into shared state. The webview's commands only
 //! READ that snapshot and push control flags (start/stop/dry/tuning) — they never block
 //! on the engine, so a long poll never freezes the UI. Mirrors v4's Arc<Mutex<>> pattern.
+//!
+//! CR-1 chunk 0 closes the two places this shell could fail in silence.
+//! * **The disk log opens in [`run`]**, before the engine thread exists, so a failure
+//!   before `Engine::new` still leaves a record. The release build hides the console
+//!   (`main.rs:4`), so a `println!` or an `eprintln!` here reaches nobody.
+//! * **A poisoned mutex is recovered, not swallowed.** It used to answer with an empty
+//!   snapshot for ever, and the dashboard simply stopped moving. See [`guard`].
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
+use spectrum_engine::config::Config;
 use spectrum_engine::engine::{Engine, Status};
+use spectrum_engine::log;
 
 struct Shared {
     running: AtomicBool,
@@ -21,6 +31,42 @@ struct Shared {
     status: Mutex<Option<Status>>,
     log: Mutex<Vec<String>>,
     cfg_path: String,
+    /// One `panel.mutex.poisoned` record per mutex, not one per tick.
+    status_poisoned: AtomicBool,
+    log_poisoned: AtomicBool,
+}
+
+/// Take a shared lock without ever freezing the panel on it.
+///
+/// `Mutex::lock` returns `Err` once any thread has panicked while holding it. This shell
+/// used to answer that with `unwrap_or(None)` and `unwrap_or_default()`, so one panic in
+/// the engine thread left the dashboard showing empty values for ever, with no line in
+/// the log, the ring or the console. The guard is recovered instead — the value behind it
+/// is the last snapshot that was published — and the poisoning is recorded once per
+/// mutex. Mirrors the log sink's own recovery (`crates\engine\src\log\sink.rs:45-49`).
+/// [CR-1 chunk 0 · DoD item 2]
+fn guard<'a, T>(
+    mutex: &'a Mutex<T>,
+    reported: &AtomicBool,
+    name: &str,
+    shows: &str,
+) -> MutexGuard<'a, T> {
+    match mutex.lock() {
+        Ok(g) => g,
+        Err(poisoned) => {
+            if !reported.swap(true, Ordering::Relaxed) {
+                log::error("panel.mutex.poisoned")
+                    .field("mutex", name)
+                    .field("shows", shows)
+                    .not_doing(
+                        "trust this snapshot as complete",
+                        "a thread panicked while holding this lock, so its update never finished; the panel recovers the guard and keeps serving what was published before the panic",
+                    )
+                    .emit();
+            }
+            poisoned.into_inner()
+        }
+    }
 }
 
 #[derive(serde::Serialize)]
@@ -40,13 +86,28 @@ struct Tuning {
 fn status(shared: tauri::State<'_, Arc<Shared>>) -> StatusView {
     StatusView {
         running: shared.running.load(Ordering::Relaxed),
-        engine: shared.status.lock().map(|g| g.clone()).unwrap_or(None),
+        engine: status_guard(&shared).clone(),
     }
 }
 
 #[tauri::command]
 fn recent_log(shared: tauri::State<'_, Arc<Shared>>) -> Vec<String> {
-    shared.log.lock().map(|g| g.clone()).unwrap_or_default()
+    log_guard(&shared).clone()
+}
+
+/// The status snapshot the dashboard tiles read.
+fn status_guard(shared: &Arc<Shared>) -> MutexGuard<'_, Option<Status>> {
+    guard(
+        &shared.status,
+        &shared.status_poisoned,
+        "status",
+        "the dashboard tiles: seen, queued, posted and dropped",
+    )
+}
+
+/// The recent-activity lines the panel's log pane reads.
+fn log_guard(shared: &Arc<Shared>) -> MutexGuard<'_, Vec<String>> {
+    guard(&shared.log, &shared.log_poisoned, "log", "the panel's recent-activity pane")
 }
 
 #[tauri::command]
@@ -103,12 +164,8 @@ fn set_tuning(shared: tauri::State<'_, Arc<Shared>>, tuning: Tuning) -> Result<(
 }
 
 fn publish(shared: &Arc<Shared>, engine: &Engine) {
-    if let Ok(mut s) = shared.status.lock() {
-        *s = Some(engine.status());
-    }
-    if let Ok(mut l) = shared.log.lock() {
-        *l = engine.recent_log(60);
-    }
+    *status_guard(shared) = Some(engine.status());
+    *log_guard(shared) = engine.recent_log(60);
 }
 
 /// The engine background thread: own a Tokio runtime, drive the cycle, publish snapshots.
@@ -116,7 +173,16 @@ fn drive(shared: Arc<Shared>) {
     let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
         Ok(rt) => rt,
         Err(e) => {
-            eprintln!("spectrum: failed to build runtime: {e}");
+            // This used to be an eprintln! and a return. The release panel hides the
+            // console, and `log::init` had not run yet, so the window then sat there for
+            // ever with an empty dashboard and no record anywhere. [CR-1 chunk 0]
+            log::error("panel.runtime.failed")
+                .err(e)
+                .not_doing(
+                    "poll, classify or post anything for as long as this panel runs",
+                    "the engine thread could not build its Tokio runtime; the window stays open with an empty dashboard until it is restarted",
+                )
+                .emit();
             return;
         }
     };
@@ -124,9 +190,9 @@ fn drive(shared: Arc<Shared>) {
         let mut engine = match Engine::new(&shared.cfg_path) {
             Ok(e) => e,
             Err(e) => {
-                if let Ok(mut l) = shared.log.lock() {
-                    *l = vec![format!("engine init failed: {e}")];
-                }
+                // `Engine::new` has already written the reason to the log; this line is
+                // the same fact in the window, where the operator is looking.
+                *log_guard(&shared) = vec![format!("engine init failed: {e}")];
                 return;
             }
         };
@@ -159,9 +225,48 @@ fn drive(shared: Arc<Shared>) {
     });
 }
 
+/// Open this run's log file, before anything can fail without one.
+///
+/// `Engine::new` opens it as well, but that happens inside the engine thread — so every
+/// failure before it (a runtime that will not build, a config that will not load) had
+/// nowhere to go, because the release build hides the console. `log::init` pins one file
+/// per resolved path, so the engine thread's later call is a no-op. [CR-1 chunk 0]
+fn open_log(cfg_path: &str) {
+    let base = Path::new(cfg_path).parent().unwrap_or_else(|| Path::new("."));
+    // A config that will not load is exactly the kind of failure the log exists to
+    // record, so the file opens either way — with the defaults when the config is gone.
+    let loaded = Config::load(cfg_path);
+    let logging = loaded.as_ref().map(|c| c.logging.clone()).unwrap_or_default();
+    if let Err(e) = log::init(&logging, base) {
+        log::error("log.init.failed")
+            .field("dir", &logging.dir)
+            .err(e)
+            .not_doing(
+                "write a log file for this run",
+                "the release panel hides the console, so nothing this run does is recorded anywhere",
+            )
+            .emit();
+    }
+    if let Err(e) = loaded {
+        log::warn("panel.config.unreadable")
+            .field("path", cfg_path)
+            .err(e)
+            .not_doing(
+                "apply the configured logging settings",
+                "this run logs with the defaults; the engine thread reports the config failure itself and then stops",
+            )
+            .emit();
+    }
+}
+
 pub fn run() {
     let cfg_path =
         std::env::var("SPECTRUM_CONFIG").unwrap_or_else(|_| "config.local.json".to_string());
+    open_log(&cfg_path);
+    log::info("panel.started")
+        .field("config", &cfg_path)
+        .flag("autostart", std::env::var("SPECTRUM_AUTOSTART").is_ok())
+        .emit();
     let shared = Arc::new(Shared {
         running: AtomicBool::new(std::env::var("SPECTRUM_AUTOSTART").is_ok()),
         dry: AtomicBool::new(false),
@@ -169,6 +274,8 @@ pub fn run() {
         status: Mutex::new(None),
         log: Mutex::new(Vec::new()),
         cfg_path,
+        status_poisoned: AtomicBool::new(false),
+        log_poisoned: AtomicBool::new(false),
     });
     {
         let s = Arc::clone(&shared);
